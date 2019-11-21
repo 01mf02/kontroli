@@ -13,6 +13,7 @@ executable kontroli
   main-is:             Main.hs
   build-depends:       base >=4.9 && <4.13,
                        attoparsec >= 0.13,
-                       bytestring >= 0.10
+                       bytestring >= 0.10,
+                       unordered-containers >= 0.2
   hs-source-dirs:      src
   default-language:    Haskell2010

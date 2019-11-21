@@ -1,4 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE DeriveTraversable #-}
 
 {-
 Sources:
@@ -13,9 +15,13 @@ https://www.reddit.com/r/haskell/comments/6dwutk/chomsky_hierarchy_parsec/
 module Main where
 
 import Control.Applicative ((<|>), many, optional)
+import Data.Bifunctor (bimap)
+import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
 import qualified Data.ByteString.Lazy as BL
+import qualified Data.HashMap.Strict as HM
+import Data.List (elemIndex, mapAccumL)
 import Data.Maybe (mapMaybe)
 import Data.Word (Word8)
 import Data.Attoparsec.ByteString.Lazy as AP
@@ -75,10 +81,10 @@ lexeme p = do
   space
   return x
 
-comment :: AP.Parser BS.ByteString
+comment :: AP.Parser ByteString
 comment = BS.append <$> AP.string "(;" <*> takeTill2 slashdotAscii rparAscii
 
-type Ident = BS.ByteString
+type Ident = ByteString
 
 bracketIdent :: AP.Parser Ident
 bracketIdent = BS.append <$> AP.string "{|" <*> takeTill2 pipeAscii rbrackAscii
@@ -107,16 +113,18 @@ type Arg = (Maybe Ident, Maybe Term)
 arg :: AP.Parser Arg
 arg = (,) <$> maybeIdent <*> optional ofTerm
 
-data Binder = Abst | Prod
-  deriving Show
-
 data Term
   = Symb Ident
+  | BVar Int
   | Appl Term Term
-  | Abs Arg Term
-  | Prd Arg Term
+  | Abst Arg Term
+  | Prod Arg Term
   | Type
   deriving Show
+
+absts, prods :: [Arg] -> Term -> Term
+absts args tm = foldr Abst tm args
+prods args tm = foldr Prod tm args
 
 sterm :: AP.Parser Term
 sterm =
@@ -126,8 +134,8 @@ sterm =
 
 term :: AP.Parser Term
 term =
-  Abs  <$> (lambda *> arg <* lamArr) <*> term <|>
-  Prd  <$> (forall *> arg <* allArr) <*> term <|>
+  Abst <$> (lambda *> arg <* lamArr) <*> term <|>
+  Prod <$> (forall *> arg <* allArr) <*> term <|>
   foldl Appl <$> sterm <*> many sterm
   where
     lambda = lexeme backslash
@@ -135,24 +143,21 @@ term =
     lamArr = lexeme (string "=>")
     allArr = lexeme (string "->")
 
-
-type Param = (Ident, Term)
-
-param = parens ((,) <$> ident <*> ofTerm)
+data DCommand t
+  = Definition  (Maybe t) (Maybe t)
+  | Theorem     t t
+  | Declaration t
+  deriving (Foldable, Functor, Traversable, Show)
 
 data Command
-  = Definition  Ident [Param] (Maybe Term) (Maybe Term)
-  | Theorem     Ident [Param] Term Term
-  | Declaration Ident [Param] Term
+  = DCmd Ident [Arg] (DCommand Term)
   | Rule Context Term Term
   deriving Show
 
 type Context = [(Ident, Maybe Term)]
 
 cmdName c = case c of
-  Definition i _ _ _ -> Just i
-  Theorem    i _ _ _ -> Just i
-  Declaration i _ _ -> Just i
+  DCmd i _ _ -> Just i
   Rule _ _ _ -> Nothing
 
 context :: AP.Parser Context
@@ -160,25 +165,99 @@ context =
   lexeme lsqu *> decl `AP.sepBy1'` lexeme comma <* lexeme rsqu
   where decl = (,) <$> ident <*> optional ofTerm
 
+command :: AP.Parser Command
 command =
-  (Definition <$> (def *> ident) <*> many param <*> optional ofTerm <*> optional isTerm) <|>
-  (Theorem <$> (thm *> ident) <*> many param <*> ofTerm <*> isTerm) <|>
-  (Declaration <$> ident <*> many param <*> ofTerm) <|>
-  (Rule <$> AP.option [] context <*> term <* rew <*> term)
+  DCmd <$> (def *> ident) <*> many param <*> (Definition <$> optional ofTerm <*> optional isTerm) <|>
+  DCmd <$> (thm *> ident) <*> many param <*> (Theorem <$> ofTerm <*> isTerm) <|>
+  DCmd <$> ident <*> many param <*> (Declaration <$> ofTerm) <|>
+  Rule <$> AP.option [] context <*> term <* rew <*> term
   where
     def = lexeme (string "def")
     thm = lexeme (string "thm")
     rew = lexeme (string "-->")
+    param = parens arg
 
-commands contents =
+parseCommands :: BL.ByteString -> [Command]
+parseCommands contents =
   if BL.null contents then []
   else case parse (space *> command <* lexeme dot) contents of
     Fail _ _ y       ->
       error ("Failure parsing command: " ++ show (BL.take 80 contents) ++ " ...\n" ++ y)
-    Done contents' x -> x : commands contents'
+    Done contents' x -> x : parseCommands contents'
+
+type SymbolTable = HM.HashMap ByteString ByteString
+type Bound = [Ident]
+
+scopeArg :: SymbolTable -> Bound -> Arg -> Either Ident Arg
+scopeArg symTable bound (maybeId, maybeTm) =
+  case maybeTm of
+    Nothing -> pure (maybeId, Nothing)
+    Just tm -> do
+      tm <- scopeTerm symTable bound tm
+      pure (maybeId, Just tm)
+
+scopeTerm :: SymbolTable -> Bound -> Term -> Either Ident Term
+scopeTerm symTable bound tm =
+  case tm of
+    Symb id ->
+      case elemIndex id bound of
+        Just i -> pure $ BVar i
+        Nothing ->
+          case HM.lookup id symTable of
+            Just sym -> pure $ Symb sym
+            Nothing -> Left id
+    Appl t1 t2 ->
+      Appl <$> scopeTerm symTable bound t1 <*> scopeTerm symTable bound t2
+    Abst arg tm ->
+      Abst <$> scopeArg symTable bound arg <*> scopeTerm symTable (addToBound arg bound) tm
+    Prod arg tm ->
+      Prod <$> scopeArg symTable bound arg <*> scopeTerm symTable (addToBound arg bound) tm
+    Type -> pure Type
+  where
+    addToBound (maybeId, _) bound =
+      case maybeId of
+        Just id -> id : bound
+        Nothing -> bound
+
+paramDCommand :: [Arg] -> DCommand Term -> DCommand Term
+paramDCommand pm dcmd =
+  case dcmd of
+    Definition ty tm ->
+      Definition (fmap (prods pm) ty) (fmap (absts pm) tm)
+    Theorem ty tm ->
+      Theorem (prods pm ty) (absts pm tm)
+    Declaration ty ->
+      Declaration (prods pm ty)
+
+scopeDCommand :: SymbolTable -> DCommand Term -> Either Ident (DCommand Term)
+scopeDCommand symTable = sequenceA . fmap (scopeTerm symTable [])
+
+data ScopeError
+  = Redefinition Ident
+  | Undefined Ident
+  deriving Show
+
+scopeCommand :: SymbolTable -> Command -> (SymbolTable, Either ScopeError Command)
+scopeCommand symTable cmd =
+  case cmd of
+    DCmd id pm dcmd ->
+      if HM.member id symTable
+      then (symTable, Left $ Redefinition id)
+      else
+        let dcmd' = scopeDCommand symTable (paramDCommand pm dcmd)
+        in (HM.insert id id symTable, bimap Undefined (DCmd id []) dcmd')
+    Rule ctx lhs rhs ->
+      (symTable, pure $ Rule ctx lhs rhs) -- TODO
+
+scopeCommands :: [Command] -> (SymbolTable, [Either ScopeError Command])
+scopeCommands = mapAccumL scopeCommand HM.empty
+
+showScopeResult :: Either ScopeError Command -> String
+showScopeResult = either ((++) "Error: " . show) (show . cmdName)
 
 main :: IO ()
 main = do
   [fileName] <- getArgs
   contents   <- BL.readFile fileName
-  mapM_ BSC.putStrLn $ mapMaybe cmdName $ commands contents
+  let cmds = parseCommands contents
+  mapM_ (putStrLn . showScopeResult) $ snd $ scopeCommands cmds
